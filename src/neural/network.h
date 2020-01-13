@@ -30,42 +30,12 @@
 #include <memory>
 #include <vector>
 
+#include "proto/net.pb.h"
+#include "utils/exception.h"
+
 namespace lczero {
 
 const int kInputPlanes = 112;
-
-struct Weights {
-  using Vec = std::vector<float>;
-  struct ConvBlock {
-    Vec weights;
-    Vec biases;
-    Vec bn_means;
-    Vec bn_stddivs;
-  };
-
-  struct Residual {
-    ConvBlock conv1;
-    ConvBlock conv2;
-  };
-
-  // Input convnet.
-  ConvBlock input;
-
-  // Residual tower.
-  std::vector<Residual> residual;
-
-  // Policy head
-  ConvBlock policy;
-  Vec ip_pol_w;
-  Vec ip_pol_b;
-
-  // Value head
-  ConvBlock value;
-  Vec ip1_val_w;
-  Vec ip1_val_b;
-  Vec ip2_val_w;
-  Vec ip2_val_b;
-};
 
 // All input planes are 64 value vectors, every element of which is either
 // 0 or some value, unique for the plane. Therefore, input is defined as
@@ -93,13 +63,30 @@ class NetworkComputation {
   virtual int GetBatchSize() const = 0;
   // Returns Q value of @sample.
   virtual float GetQVal(int sample) const = 0;
+  virtual float GetDVal(int sample) const = 0;
   // Returns P value @move_id of @sample.
   virtual float GetPVal(int sample, int move_id) const = 0;
   virtual ~NetworkComputation() {}
 };
 
+struct NetworkCapabilities {
+  pblczero::NetworkFormat::InputFormat input_format;
+  // TODO expose information of whether GetDVal() is usable or always zero.
+
+  // Combines capabilities by setting the most restrictive ones. May throw
+  // exception.
+  void Merge(const NetworkCapabilities& other) {
+    if (input_format != other.input_format) {
+      throw Exception("Incompatible input formats, " +
+                      std::to_string(input_format) + " vs " +
+                      std::to_string(other.input_format));
+    }
+  }
+};
+
 class Network {
  public:
+  virtual const NetworkCapabilities& GetCapabilities() const = 0;
   virtual std::unique_ptr<NetworkComputation> NewComputation() = 0;
   virtual ~Network(){};
 };

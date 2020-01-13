@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2018-2019 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -25,231 +25,135 @@
   Program grant you additional permission to convey the resulting work.
 */
 
+#include "engine.h"
+
 #include <algorithm>
 #include <cmath>
 #include <functional>
 
-#include "engine.h"
 #include "mcts/search.h"
-#include "neural/factory.h"
-#include "neural/loader.h"
+#include "mcts/stoppers/factory.h"
 #include "utils/configfile.h"
+#include "utils/logging.h"
 
 namespace lczero {
 namespace {
-// TODO(mooskagh) Move threads parameter handling to search.
 const int kDefaultThreads = 2;
-const char* kThreadsOption = "Number of worker threads";
-const char* kDebugLogStr = "Do debug logging into file";
 
-// TODO(mooskagh) Move weights/backend/backend-opts parameter handling to
-//                network factory.
-const char* kWeightsStr = "Network weights file path";
-const char* kNnBackendStr = "NN backend to use";
-const char* kNnBackendOptionsStr = "NN backend parameters";
-const char* kSlowMoverStr = "Scale thinking time";
-const char* kMoveOverheadStr = "Move time overhead in milliseconds";
-const char* kTimeCurvePeak = "Time weight curve peak ply";
-const char* kTimeCurveRightWidth = "Time weight curve width right of peak";
-const char* kTimeCurveLeftWidth = "Time weight curve width left of peak";
-const char* kSyzygyTablebaseStr = "List of Syzygy tablebase directories";
-const char* kSpendSavedTime = "Fraction of saved time to use immediately";
+const OptionId kThreadsOptionId{"threads", "Threads",
+                                "Number of (CPU) worker threads to use.", 't'};
+const OptionId kLogFileId{"logfile", "LogFile",
+                          "Write log to that file. Special value <stderr> to "
+                          "output the log to the console.",
+                          'l'};
+const OptionId kSyzygyTablebaseId{
+    "syzygy-paths", "SyzygyPath",
+    "List of Syzygy tablebase directories, list entries separated by system "
+    "separator (\";\" for Windows, \":\" for Linux).",
+    's'};
+const OptionId kPonderId{"ponder", "Ponder",
+                         "This option is ignored. Here to please chess GUIs."};
+const OptionId kUciChess960{
+    "chess960", "UCI_Chess960",
+    "Castling moves are encoded as \"king takes rook\"."};
+const OptionId kShowWDL{"show-wdl", "UCI_ShowWDL",
+                        "Show win, draw and lose probability."};
 
-const char* kAutoDiscover = "<autodiscover>";
-
-float ComputeMoveWeight(int ply, float peak, float left_width,
-                        float right_width) {
-  // Inflection points of the function are at ply = peak +/- width.
-  // At these points the function is at 2/3 of its max value.
-  const float width = ply > peak ? right_width : left_width;
-  constexpr float width_scaler = 1.518651485f;  // 2 / log(2 + sqrt(3))
-  return std::pow(std::cosh((ply - peak) / width / width_scaler), -2.0f);
+MoveList StringsToMovelist(const std::vector<std::string>& moves,
+                           const ChessBoard& board) {
+  MoveList result;
+  result.reserve(moves.size());
+  for (const auto& move : moves) {
+    result.emplace_back(board.GetModernMove({move, board.flipped()}));
+  }
+  return result;
 }
 
 }  // namespace
 
-EngineController::EngineController(BestMoveInfo::Callback best_move_callback,
-                                   ThinkingInfo::Callback info_callback,
+EngineController::EngineController(std::unique_ptr<UciResponder> uci_responder,
                                    const OptionsDict& options)
     : options_(options),
-      best_move_callback_(best_move_callback),
-      info_callback_(info_callback) {}
+      uci_responder_(std::move(uci_responder)),
+      time_manager_(MakeLegacyTimeManager()) {}
 
 void EngineController::PopulateOptions(OptionsParser* options) {
   using namespace std::placeholders;
 
-  options->Add<StringOption>(kWeightsStr, "weights", 'w') = kAutoDiscover;
-  options->Add<IntOption>(kThreadsOption, 1, 128, "threads", 't') =
-      kDefaultThreads;
-  options->Add<IntOption>(
-      "NNCache size", 0, 999999999, "nncache", '\0',
-      std::bind(&EngineController::SetCacheSize, this, _1)) = 200000;
+  NetworkFactory::PopulateOptions(options);
+  options->Add<IntOption>(kThreadsOptionId, 1, 128) = kDefaultThreads;
+  options->Add<IntOption>(kNNCacheSizeId, 0, 999999999) = 200000;
+  SearchParams::Populate(options);
 
-  const auto backends = NetworkFactory::Get()->GetBackendsList();
-  options->Add<ChoiceOption>(kNnBackendStr, backends, "backend") =
-      backends.empty() ? "<none>" : backends[0];
-  options->Add<StringOption>(kNnBackendOptionsStr, "backend-opts");
-  options->Add<FloatOption>(kSlowMoverStr, 0.0f, 100.0f, "slowmover") = 1.0f;
-  options->Add<IntOption>(kMoveOverheadStr, 0, 10000, "move-overhead") = 100;
-  options->Add<FloatOption>(kTimeCurvePeak, -1000.0f, 1000.0f,
-                            "time-curve-peak") = 26.2f;
-  options->Add<FloatOption>(kTimeCurveLeftWidth, 0.0f, 1000.0f,
-                            "time-curve-left-width") = 82.0f;
-  options->Add<FloatOption>(kTimeCurveRightWidth, 0.0f, 1000.0f,
-                            "time-curve-right-width") = 74.0f;
-  options->Add<StringOption>(kSyzygyTablebaseStr, "syzygy-paths", 's');
+  options->Add<StringOption>(kSyzygyTablebaseId);
   // Add "Ponder" option to signal to GUIs that we support pondering.
   // This option is currently not used by lc0 in any way.
-  options->Add<BoolOption>("Ponder", "ponder") = false;
-  options->Add<FloatOption>(kSpendSavedTime, 0.0f, 1.0f, "immediate-time-use") =
-      0.6f;
+  options->Add<BoolOption>(kPonderId) = true;
+  options->Add<BoolOption>(kUciChess960) = false;
+  options->Add<BoolOption>(kShowWDL) = false;
 
-  Search::PopulateUciParams(options);
   ConfigFile::PopulateOptions(options);
-
-  auto defaults = options->GetMutableDefaultsOptions();
-
-  defaults->Set<int>(Search::kMiniBatchSizeStr, 256);    // Minibatch = 256
-  defaults->Set<float>(Search::kFpuReductionStr, 1.2f);  // FPU reduction = 1.2
-  defaults->Set<float>(Search::kCpuctStr, 3.4f);         // CPUCT = 3.4
-  defaults->Set<float>(Search::kPolicySoftmaxTempStr, 2.2f);  // Psoftmax = 2.2
-  defaults->Set<int>(Search::kAllowedNodeCollisionsStr, 32);  // Node collisions
-  defaults->Set<int>(Search::kCacheHistoryLengthStr, 0);
-  defaults->Set<bool>(Search::kOutOfOrderEvalStr, true);
+  PopulateTimeManagementOptions(RunType::kUci, options);
 }
 
-SearchLimits EngineController::PopulateSearchLimits(int ply, bool is_black,
-                                                    const GoParams& params) {
-  SearchLimits limits;
-  limits.time_ms = params.movetime;
-  int64_t time = (is_black ? params.btime : params.wtime);
-  if (!params.searchmoves.empty()) {
-    limits.searchmoves.reserve(params.searchmoves.size());
-    for (const auto& move : params.searchmoves) {
-      limits.searchmoves.emplace_back(move, is_black);
-    }
-  }
-  limits.infinite = params.infinite || params.ponder;
-  limits.visits = limits.infinite ? -1 : params.nodes;
-  if (limits.infinite || time < 0) return limits;
-  int increment = std::max(int64_t(0), is_black ? params.binc : params.winc);
-
-  int movestogo = params.movestogo < 0 ? 50 : params.movestogo;
-  // Fix non-standard uci command.
-  if (movestogo == 0) movestogo = 1;
-
-  // How to scale moves time.
-  float slowmover = options_.Get<float>(kSlowMoverStr);
-  int64_t move_overhead = options_.Get<int>(kMoveOverheadStr);
-  float time_curve_peak = options_.Get<float>(kTimeCurvePeak);
-  float time_curve_left_width = options_.Get<float>(kTimeCurveLeftWidth);
-  float time_curve_right_width = options_.Get<float>(kTimeCurveRightWidth);
-
-  // Total time till control including increments.
-  auto total_moves_time =
-      std::max(int64_t{0}, time + increment * (movestogo - 1) - move_overhead);
-
-  // If there is time spared from previous searches, the `time_to_squander` part
-  // of it will be used immediately, remove that from planning.
-  int time_to_squander = 0;
-  if (time_spared_ms_ > 0) {
-    time_to_squander = time_spared_ms_ * options_.Get<float>(kSpendSavedTime);
-    time_spared_ms_ -= time_to_squander;
-    total_moves_time -= time_to_squander;
-  }
-
-  constexpr int kSmartPruningToleranceMs = 200;
-  float this_move_weight = ComputeMoveWeight(
-      ply, time_curve_peak, time_curve_left_width, time_curve_right_width);
-  float other_move_weights = 0.0f;
-  for (int i = 1; i < movestogo; ++i)
-    other_move_weights +=
-        ComputeMoveWeight(ply + 2 * i, time_curve_peak, time_curve_left_width,
-                          time_curve_right_width);
-  // Compute the move time without slowmover.
-  float this_move_time = total_moves_time * this_move_weight /
-                         (this_move_weight + other_move_weights);
-
-  // Only extend thinking time with slowmover if smart pruning can potentially
-  // reduce it.
-  if (slowmover < 1.0 ||
-      this_move_time * slowmover > kSmartPruningToleranceMs) {
-    this_move_time *= slowmover;
-    // If time is planned to be overused because of slowmover, remove excess
-    // of that time from spared time.
-    time_spared_ms_ -= this_move_time * (slowmover - 1);
-  }
-
-  // Use `time_to_squander` time immediately.
-  this_move_time += time_to_squander;
-
-  // Make sure we don't exceed current time limit with what we calculated.
-  limits.time_ms = std::max(
-      int64_t{0},
-      std::min(static_cast<int64_t>(this_move_time), time - move_overhead));
-  return limits;
+void EngineController::ResetMoveTimer() {
+  move_start_time_ = std::chrono::steady_clock::now();
 }
 
-void EngineController::UpdateTBAndNetwork() {
+// Updates values from Uci options.
+void EngineController::UpdateFromUciOptions() {
   SharedLock lock(busy_mutex_);
 
-  std::string tb_paths = options_.Get<std::string>(kSyzygyTablebaseStr);
+  // Syzygy tablebases.
+  std::string tb_paths = options_.Get<std::string>(kSyzygyTablebaseId.GetId());
   if (!tb_paths.empty() && tb_paths != tb_paths_) {
     syzygy_tb_ = std::make_unique<SyzygyTablebase>();
-    std::cerr << "Loading Syzygy tablebases from " << tb_paths << std::endl;
+    CERR << "Loading Syzygy tablebases from " << tb_paths;
     if (!syzygy_tb_->init(tb_paths)) {
-      std::cerr << "Failed to load Syzygy tablebases!" << std::endl;
+      CERR << "Failed to load Syzygy tablebases!";
       syzygy_tb_ = nullptr;
     } else {
       tb_paths_ = tb_paths;
     }
   }
 
-  std::string network_path = options_.Get<std::string>(kWeightsStr);
-  std::string backend = options_.Get<std::string>(kNnBackendStr);
-  std::string backend_options = options_.Get<std::string>(kNnBackendOptionsStr);
-
-  if (network_path == network_path_ && backend == backend_ &&
-      backend_options == backend_options_)
-    return;
-
-  network_path_ = network_path;
-  backend_ = backend;
-  backend_options_ = backend_options;
-
-  std::string net_path = network_path;
-  if (net_path == kAutoDiscover) {
-    net_path = DiscoverWeightsFile();
-  } else {
-    std::cerr << "Loading weights file from: " << net_path << std::endl;
+  // Network.
+  const auto network_configuration =
+      NetworkFactory::BackendConfiguration(options_);
+  if (network_configuration_ != network_configuration) {
+    network_ = NetworkFactory::LoadNetwork(options_);
+    network_configuration_ = network_configuration;
   }
-  Weights weights = LoadWeightsFromFile(net_path);
 
-  OptionsDict network_options =
-      OptionsDict::FromString(backend_options, &options_);
-
-  network_ = NetworkFactory::Get()->Create(backend, weights, network_options);
+  // Cache size.
+  cache_.SetCapacity(options_.Get<int>(kNNCacheSizeId.GetId()));
 }
 
-void EngineController::SetCacheSize(int size) { cache_.SetCapacity(size); }
-
 void EngineController::EnsureReady() {
-  UpdateTBAndNetwork();
   std::unique_lock<RpSharedMutex> lock(busy_mutex_);
+  // If a UCI host is waiting for our ready response, we can consider the move
+  // not started until we're done ensuring ready.
+  ResetMoveTimer();
 }
 
 void EngineController::NewGame() {
+  // In case anything relies upon defaulting to default position and just calls
+  // newgame and goes straight into go.
+  ResetMoveTimer();
   SharedLock lock(busy_mutex_);
   cache_.Clear();
   search_.reset();
   tree_.reset();
-  time_spared_ms_ = 0;
+  time_manager_->ResetGame();
   current_position_.reset();
-  UpdateTBAndNetwork();
+  UpdateFromUciOptions();
 }
 
 void EngineController::SetPosition(const std::string& fen,
                                    const std::vector<std::string>& moves_str) {
+  // Some UCI hosts just call position then immediately call go, while starting
+  // the clock on calling 'position'.
+  ResetMoveTimer();
   SharedLock lock(busy_mutex_);
   current_position_ = CurrentPosition{fen, moves_str};
   search_.reset();
@@ -260,21 +164,61 @@ void EngineController::SetupPosition(
   SharedLock lock(busy_mutex_);
   search_.reset();
 
+  UpdateFromUciOptions();
+
   if (!tree_) tree_ = std::make_unique<NodeTree>();
 
   std::vector<Move> moves;
   for (const auto& move : moves_str) moves.emplace_back(move);
-  bool is_same_game = tree_->ResetToPosition(fen, moves);
-  if (!is_same_game) time_spared_ms_ = 0;
-  UpdateTBAndNetwork();
+  const bool is_same_game = tree_->ResetToPosition(fen, moves);
+  if (!is_same_game) time_manager_->ResetGame();
 }
 
+namespace {
+
+class PonderResponseTransformer : public TransformingUciResponder {
+ public:
+  PonderResponseTransformer(std::unique_ptr<UciResponder> parent,
+                            std::string ponder_move)
+      : TransformingUciResponder(std::move(parent)),
+        ponder_move_(std::move(ponder_move)) {}
+
+  void TransformThinkingInfo(std::vector<ThinkingInfo>* infos) override {
+    // Output all stats from main variation (not necessary the ponder move)
+    // but PV only from ponder move.
+    ThinkingInfo ponder_info;
+    for (const auto& info : *infos) {
+      if (info.multipv <= 1) {
+        ponder_info = info;
+        if (ponder_info.score) ponder_info.score = -*ponder_info.score;
+        if (ponder_info.depth > 1) ponder_info.depth--;
+        if (ponder_info.seldepth > 1) ponder_info.seldepth--;
+        ponder_info.pv.clear();
+      }
+      if (!info.pv.empty() && info.pv[0].as_string() == ponder_move_) {
+        ponder_info.pv.assign(info.pv.begin() + 1, info.pv.end());
+      }
+    }
+    infos->clear();
+    infos->push_back(ponder_info);
+  }
+
+ private:
+  std::string ponder_move_;
+};
+
+}  // namespace
+
 void EngineController::Go(const GoParams& params) {
-  auto start_time = std::chrono::steady_clock::now();
+  // TODO: should consecutive calls to go be considered to be a continuation and
+  // hence have the same start time like this behaves, or should we check start
+  // time hasn't changed since last call to go and capture the new start time
+  // now?
+  if (!move_start_time_) ResetMoveTimer();
   go_params_ = params;
 
-  ThinkingInfo::Callback info_callback(info_callback_);
-  BestMoveInfo::Callback best_move_callback(best_move_callback_);
+  std::unique_ptr<UciResponder> responder =
+      std::make_unique<NonOwningUciRespondForwarder>(uci_responder_.get());
 
   // Setting up current position, now that it's known whether it's ponder or
   // not.
@@ -284,78 +228,63 @@ void EngineController::Go(const GoParams& params) {
       std::string ponder_move = moves.back();
       moves.pop_back();
       SetupPosition(current_position_->fen, moves);
-
-      info_callback = [this,
-                       ponder_move](const std::vector<ThinkingInfo>& infos) {
-        ThinkingInfo ponder_info;
-        // Output all stats from main variation (not necessary the ponder move)
-        // but PV only from ponder move.
-        for (const auto& info : infos) {
-          if (info.multipv <= 1) {
-            ponder_info = info;
-            if (ponder_info.score) ponder_info.score = -*ponder_info.score;
-            if (ponder_info.depth > 1) ponder_info.depth--;
-            if (ponder_info.seldepth > 1) ponder_info.seldepth--;
-            ponder_info.pv.clear();
-          }
-          if (!info.pv.empty() && info.pv[0].as_string() == ponder_move) {
-            ponder_info.pv.assign(info.pv.begin() + 1, info.pv.end());
-          }
-        }
-        info_callback_({ponder_info});
-      };
+      responder = std::make_unique<PonderResponseTransformer>(
+          std::move(responder), ponder_move);
     } else {
       SetupPosition(current_position_->fen, current_position_->moves);
     }
   } else if (!tree_) {
-    SetupPosition(ChessBoard::kStartingFen, {});
+    SetupPosition(ChessBoard::kStartposFen, {});
   }
 
-  auto limits = PopulateSearchLimits(tree_->GetPlyCount(),
-                                     tree_->IsBlackToMove(), params);
-
-  // If there is a time limit, also store amount of time saved.
-  if (limits.time_ms >= 0) {
-    best_move_callback = [this, start_time, limits](const BestMoveInfo& info) {
-      best_move_callback_(info);
-      auto time_spent = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - start_time)
-                            .count();
-      time_spared_ms_ += limits.time_ms - time_spent;
-    };
+  if (!options_.Get<bool>(kUciChess960.GetId())) {
+    // Remap FRC castling to legacy castling.
+    responder = std::make_unique<Chess960Transformer>(
+        std::move(responder), tree_->HeadPosition().GetBoard());
   }
 
-  search_ = std::make_unique<Search>(*tree_, network_.get(), best_move_callback,
-                                     info_callback, limits, options_, &cache_,
-                                     syzygy_tb_.get());
+  if (!options_.Get<bool>(kShowWDL.GetId())) {
+    // Strip WDL information from the response.
+    responder = std::make_unique<WDLResponseFilter>(std::move(responder));
+  }
 
-  search_->StartThreads(options_.Get<int>(kThreadsOption));
+  auto stopper =
+      time_manager_->GetStopper(options_, params, tree_->HeadPosition());
+  search_ = std::make_unique<Search>(
+      *tree_, network_.get(), std::move(responder),
+      StringsToMovelist(params.searchmoves, tree_->HeadPosition().GetBoard()),
+      *move_start_time_, std::move(stopper), params.infinite || params.ponder,
+      options_, &cache_, syzygy_tb_.get());
+
+  LOGFILE << "Timer started at "
+          << FormatTime(SteadyClockToSystemClock(*move_start_time_));
+  search_->StartThreads(options_.Get<int>(kThreadsOptionId.GetId()));
 }
 
 void EngineController::PonderHit() {
+  ResetMoveTimer();
   go_params_.ponder = false;
   Go(go_params_);
 }
 
 void EngineController::Stop() {
-  if (search_) {
-    search_->Stop();
-    search_->Wait();
-  }
+  if (search_) search_->Stop();
 }
 
 EngineLoop::EngineLoop()
-    : engine_(std::bind(&UciLoop::SendBestMove, this, std::placeholders::_1),
-              std::bind(&UciLoop::SendInfo, this, std::placeholders::_1),
-              options_.GetOptionsDict()) {
+    : engine_(
+          std::make_unique<CallbackUciResponder>(
+              std::bind(&UciLoop::SendBestMove, this, std::placeholders::_1),
+              std::bind(&UciLoop::SendInfo, this, std::placeholders::_1)),
+          options_.GetOptionsDict()) {
   engine_.PopulateOptions(&options_);
-  options_.Add<StringOption>(
-      kDebugLogStr, "debuglog", 'l',
-      [this](const std::string& filename) { SetLogFilename(filename); }) = "";
+  options_.Add<StringOption>(kLogFileId);
 }
 
 void EngineLoop::RunLoop() {
   if (!ConfigFile::Init(&options_) || !options_.ProcessAllFlags()) return;
+  Logging::Get().SetFilename(
+      options_.GetOptionsDict().Get<std::string>(kLogFileId.GetId()));
   UciLoop::RunLoop();
 }
 
@@ -374,36 +303,22 @@ void EngineLoop::CmdIsReady() {
 
 void EngineLoop::CmdSetOption(const std::string& name, const std::string& value,
                               const std::string& context) {
-  options_.SetOption(name, value, context);
-  if (options_sent_) {
-    options_.SendOption(name);
-  }
+  options_.SetUciOption(name, value, context);
+  // Set the log filename for the case it was set in UCI option.
+  Logging::Get().SetFilename(
+      options_.GetOptionsDict().Get<std::string>(kLogFileId.GetId()));
 }
 
-void EngineLoop::EnsureOptionsSent() {
-  if (!options_sent_) {
-    options_.SendAllOptions();
-    options_sent_ = true;
-  }
-}
-
-void EngineLoop::CmdUciNewGame() {
-  EnsureOptionsSent();
-  engine_.NewGame();
-}
+void EngineLoop::CmdUciNewGame() { engine_.NewGame(); }
 
 void EngineLoop::CmdPosition(const std::string& position,
                              const std::vector<std::string>& moves) {
-  EnsureOptionsSent();
   std::string fen = position;
-  if (fen.empty()) fen = ChessBoard::kStartingFen;
+  if (fen.empty()) fen = ChessBoard::kStartposFen;
   engine_.SetPosition(fen, moves);
 }
 
-void EngineLoop::CmdGo(const GoParams& params) {
-  EnsureOptionsSent();
-  engine_.Go(params);
-}
+void EngineLoop::CmdGo(const GoParams& params) { engine_.Go(params); }
 
 void EngineLoop::CmdPonderHit() { engine_.PonderHit(); }
 

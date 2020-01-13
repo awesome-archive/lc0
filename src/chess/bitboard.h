@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2018-2019 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -41,7 +41,7 @@ class BoardSquare {
  public:
   constexpr BoardSquare() {}
   // As a single number, 0 to 63, bottom to top, left to right.
-  // 0 is a1, 8 is b1, 63 is h8.
+  // 0 is a1, 8 is a2, 63 is h8.
   constexpr BoardSquare(std::uint8_t num) : square_(num) {}
   // From row(bottom to top), and col(left to right), 0-based.
   constexpr BoardSquare(int row, int col) : BoardSquare(row * 8 + col) {}
@@ -177,6 +177,10 @@ class BitBoard {
     return board_ == other.board_;
   }
 
+  bool operator!=(const BitBoard& other) const {
+    return board_ != other.board_;
+  }
+
   BitIterator<BoardSquare> begin() const { return board_; }
   BitIterator<BoardSquare> end() const { return 0; }
 
@@ -195,7 +199,7 @@ class BitBoard {
   }
 
   // Applies a mask to the bitboard (intersects).
-  BitBoard& operator*=(const BitBoard& a) {
+  BitBoard& operator&=(const BitBoard& a) {
     board_ &= a.board_;
     return *this;
   }
@@ -206,8 +210,13 @@ class BitBoard {
   }
 
   // Returns union (bitwise OR) of two boards.
-  friend BitBoard operator+(const BitBoard& a, const BitBoard& b) {
+  friend BitBoard operator|(const BitBoard& a, const BitBoard& b) {
     return {a.board_ | b.board_};
+  }
+
+  // Returns intersection (bitwise AND) of two boards.
+  friend BitBoard operator&(const BitBoard& a, const BitBoard& b) {
+    return {a.board_ & b.board_};
   }
 
   // Returns bitboard with one bit reset.
@@ -220,11 +229,6 @@ class BitBoard {
     return {a.board_ & ~b.board_};
   }
 
-  // Returns intersection (bitwise AND) of two boards.
-  friend BitBoard operator*(const BitBoard& a, const BitBoard& b) {
-    return {a.board_ & b.board_};
-  }
-
  private:
   std::uint64_t board_ = 0;
 };
@@ -233,9 +237,9 @@ class Move {
  public:
   enum class Promotion : std::uint8_t { None, Queen, Rook, Bishop, Knight };
   Move() = default;
-  Move(BoardSquare from, BoardSquare to)
+  constexpr Move(BoardSquare from, BoardSquare to)
       : data_(to.as_int() + (from.as_int() << 6)) {}
-  Move(BoardSquare from, BoardSquare to, Promotion promotion)
+  constexpr Move(BoardSquare from, BoardSquare to, Promotion promotion)
       : data_(to.as_int() + (from.as_int() << 6) +
               (static_cast<uint8_t>(promotion) << 12)) {}
   Move(const std::string& str, bool black = false);
@@ -244,8 +248,6 @@ class Move {
   BoardSquare to() const { return BoardSquare(data_ & kToMask); }
   BoardSquare from() const { return BoardSquare((data_ & kFromMask) >> 6); }
   Promotion promotion() const { return Promotion((data_ & kPromoMask) >> 12); }
-  bool castling() const { return (data_ & kCastleMask) != 0; }
-  void SetCastling() { data_ |= kCastleMask; }
 
   void SetTo(BoardSquare to) { data_ = (data_ & ~kToMask) | to.as_int(); }
   void SetFrom(BoardSquare from) {
@@ -260,15 +262,8 @@ class Move {
   // 0 .. 1857, to use in neural networks.
   uint16_t as_nn_index() const;
 
-  // We ignore the castling bit, because UCI's `position moves ...` commands
-  // specify squares and promotions, but NOT whether or not a move is castling.
-  // NodeTree::MakeMove and all Move::Move constructors are thus so ignorant.
-  bool operator==(const Move& other) const {
-    return (data_ | kCastleMask) == (other.data_ | kCastleMask);
-  }
-
-  bool operator!=(const Move& other) const { return !operator==(other); }
-  operator bool() const { return data_ != 0; }
+  explicit operator bool() const { return data_ != 0; }
+  bool operator==(const Move& other) { return data_ == other.data_; }
 
   void Mirror() { data_ ^= 0b111000111000; }
 
@@ -296,13 +291,11 @@ class Move {
   // bits 0..5 "to"-square
   // bits 6..11 "from"-square
   // bits 12..14 promotion value
-  // bit 15 whether move is a castling
 
   enum Masks : uint16_t {
     kToMask = 0b0000000000111111,
     kFromMask = 0b0000111111000000,
     kPromoMask = 0b0111000000000000,
-    kCastleMask = 0b1000000000000000,
   };
 };
 

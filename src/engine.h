@@ -30,15 +30,12 @@
 #include "chess/uciloop.h"
 #include "mcts/search.h"
 #include "neural/cache.h"
+#include "neural/factory.h"
 #include "neural/network.h"
 #include "syzygy/syzygy.h"
 #include "utils/mutex.h"
 #include "utils/optional.h"
 #include "utils/optionsparser.h"
-
-// CUDNN eval
-// comment/disable this to enable tensor flow path
-#define CUDNN_EVAL 1
 
 namespace lczero {
 
@@ -49,8 +46,7 @@ struct CurrentPosition {
 
 class EngineController {
  public:
-  EngineController(BestMoveInfo::Callback best_move_callback,
-                   ThinkingInfo::Callback info_callback,
+  EngineController(std::unique_ptr<UciResponder> uci_responder,
                    const OptionsDict& options);
 
   ~EngineController() {
@@ -76,26 +72,23 @@ class EngineController {
   void PonderHit();
   // Must not block.
   void Stop();
-  void SetCacheSize(int size);
-
-  SearchLimits PopulateSearchLimits(int ply, bool is_black,
-                                    const GoParams& params);
 
  private:
-  void UpdateTBAndNetwork();
+  void UpdateFromUciOptions();
 
   void SetupPosition(const std::string& fen,
                      const std::vector<std::string>& moves);
+  void ResetMoveTimer();
 
   const OptionsDict& options_;
 
-  BestMoveInfo::Callback best_move_callback_;
-  ThinkingInfo::Callback info_callback_;
+  std::unique_ptr<UciResponder> uci_responder_;
 
   // Locked means that there is some work to wait before responding readyok.
   RpSharedMutex busy_mutex_;
   using SharedLock = std::shared_lock<RpSharedMutex>;
 
+  std::unique_ptr<TimeManager> time_manager_;
   std::unique_ptr<Search> search_;
   std::unique_ptr<NodeTree> tree_;
   std::unique_ptr<SyzygyTablebase> syzygy_tb_;
@@ -105,9 +98,7 @@ class EngineController {
   // Store current TB and network settings to track when they change so that
   // they are reloaded.
   std::string tb_paths_;
-  std::string network_path_;
-  std::string backend_;
-  std::string backend_options_;
+  NetworkFactory::BackendConfiguration network_configuration_;
 
   // The current position as given with SetPosition. For normal (ie. non-ponder)
   // search, the tree is set up with this position, however, during ponder we
@@ -115,8 +106,7 @@ class EngineController {
   optional<CurrentPosition> current_position_;
   GoParams go_params_;
 
-  // How much less time was used by search than what was allocated.
-  int64_t time_spared_ms_ = 0;
+  optional<std::chrono::steady_clock::time_point> move_start_time_;
 };
 
 class EngineLoop : public UciLoop {
@@ -136,10 +126,7 @@ class EngineLoop : public UciLoop {
   void CmdStop() override;
 
  private:
-  void EnsureOptionsSent();
-
   OptionsParser options_;
-  bool options_sent_ = false;
   EngineController engine_;
 };
 

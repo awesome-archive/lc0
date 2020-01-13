@@ -30,39 +30,32 @@
 #include <functional>
 #include <shared_mutex>
 #include <thread>
+
 #include "chess/callbacks.h"
 #include "chess/uciloop.h"
 #include "mcts/node.h"
+#include "mcts/params.h"
+#include "mcts/stoppers/timemgr.h"
 #include "neural/cache.h"
 #include "neural/network.h"
 #include "syzygy/syzygy.h"
+#include "utils/logging.h"
 #include "utils/mutex.h"
 #include "utils/optional.h"
-#include "utils/optionsdict.h"
-#include "utils/optionsparser.h"
 
 namespace lczero {
-
-struct SearchLimits {
-  std::int64_t visits = -1;
-  std::int64_t playouts = -1;
-  std::int64_t time_ms = -1;
-  bool infinite = false;
-  MoveList searchmoves;
-};
 
 class Search {
  public:
   Search(const NodeTree& tree, Network* network,
-         BestMoveInfo::Callback best_move_callback,
-         ThinkingInfo::Callback info_callback, const SearchLimits& limits,
+         std::unique_ptr<UciResponder> uci_responder,
+         const MoveList& searchmoves,
+         std::chrono::steady_clock::time_point start_time,
+         std::unique_ptr<SearchStopper> stopper, bool infinite,
          const OptionsDict& options, NNCache* cache,
          SyzygyTablebase* syzygy_tb);
 
   ~Search();
-
-  // Populates UciOptions with search parameters.
-  static void PopulateUciParams(OptionsParser* options);
 
   // Starts worker threads and returns immediately.
   void StartThreads(size_t how_many);
@@ -83,34 +76,24 @@ class Search {
 
   // Returns best move, from the point of view of white player. And also ponder.
   // May or may not use temperature, according to the settings.
-  std::pair<Move, Move> GetBestMove() const;
+  std::pair<Move, Move> GetBestMove();
   // Returns the evaluation of the best move, WITHOUT temperature. This differs
   // from the above function; with temperature enabled, these two functions may
   // return results from different possible moves.
-  float GetBestEval() const;
+  // Returns pair {Q, D}.
+  std::pair<float, float> GetBestEval() const;
+  // Returns the total number of playouts in the search.
+  std::int64_t GetTotalPlayouts() const;
+  // Returns the search parameters.
+  const SearchParams& GetParams() const { return params_; }
 
-  // Strings for UCI params. So that others can override defaults.
-  // TODO(mooskagh) There are too many options for now. Factor out that into a
-  // separate class.
-  static const char* kMiniBatchSizeStr;
-  static const char* kMaxPrefetchBatchStr;
-  static const char* kCpuctStr;
-  static const char* kTemperatureStr;
-  static const char* kTempDecayMovesStr;
-  static const char* kTemperatureVisitOffsetStr;
-  static const char* kNoiseStr;
-  static const char* kVerboseStatsStr;
-  static const char* kAggressiveTimePruningStr;
-  static const char* kFpuReductionStr;
-  static const char* kCacheHistoryLengthStr;
-  static const char* kPolicySoftmaxTempStr;
-  static const char* kAllowedNodeCollisionsStr;
-  static const char* kOutOfOrderEvalStr;
-  static const char* kMultiPvStr;
+  // If called after GetBestMove, another call to GetBestMove will have results
+  // from temperature having been applied again.
+  void ResetBestMove();
 
  private:
-  // Returns the best move, maybe with temperature (according to the settings).
-  std::pair<Move, Move> GetBestMoveInternal() const;
+  // Computes the best move, maybe with temperature (according to the settings).
+  void EnsureBestMoveKnown();
 
   // Returns a child with most visits, with or without temperature.
   // NoTemperature is safe to use on non-extended nodes, while WithTemperature
@@ -122,8 +105,7 @@ class Search {
                                           float temperature) const;
 
   int64_t GetTimeSinceStart() const;
-  void UpdateRemainingMoves();
-  void MaybeTriggerStop();
+  void MaybeTriggerStop(const IterationStats& stats, StoppersHints* hints);
   void MaybeOutputInfo();
   void SendUciInfo();  // Requires nodes_mutex_ to be held.
   // Sets stop to true and notifies watchdog thread.
@@ -138,22 +120,35 @@ class Search {
   // Returns true if the population came from tablebase.
   bool PopulateRootMoveLimit(MoveList* root_moves) const;
 
-  // We only need first ply for debug output, but could be easily generalized.
-  NNCacheLock GetCachedFirstPlyResult(EdgeAndNode) const;
+  // Fills IterationStats with global (rather than per-thread) portion of search
+  // statistics. Currently all stats there (in IterationStats) are global
+  // though.
+  void PopulateCommonIterationStats(IterationStats* stats);
+
+  // Returns verbose information about given node, as vector of strings.
+  std::vector<std::string> GetVerboseStats(Node* node,
+                                           bool is_black_to_move) const;
+
+  // Returns NN eval for a given node from cache, if that node is cached.
+  NNCacheLock GetCachedNNEval(Node* node) const;
 
   mutable Mutex counters_mutex_ ACQUIRED_AFTER(nodes_mutex_);
   // Tells all threads to stop.
-  bool stop_ GUARDED_BY(counters_mutex_) = false;
+  std::atomic<bool> stop_{false};
   // Condition variable used to watch stop_ variable.
   std::condition_variable watchdog_cv_;
+  // Tells whether it's ok to respond bestmove when limits are reached.
+  // If false (e.g. during ponder or `go infinite`) the search stops but nothing
+  // is responded until `stop` uci command.
+  bool ok_to_respond_bestmove_ GUARDED_BY(counters_mutex_) = true;
   // There is already one thread that responded bestmove, other threads
   // should not do that.
-  bool responded_bestmove_ GUARDED_BY(counters_mutex_) = false;
-  // Becomes true when smart pruning decides that no better move can be found.
-  bool found_best_move_ GUARDED_BY(counters_mutex_) = false;
+  bool bestmove_is_sent_ GUARDED_BY(counters_mutex_) = false;
   // Stored so that in the case of non-zero temperature GetBestMove() returns
   // consistent results.
-  std::pair<Move, Move> best_move_ GUARDED_BY(counters_mutex_);
+  EdgeAndNode final_bestmove_ GUARDED_BY(counters_mutex_);
+  EdgeAndNode final_pondermove_ GUARDED_BY(counters_mutex_);
+  std::unique_ptr<SearchStopper> stopper_ GUARDED_BY(counters_mutex_);
 
   Mutex threads_mutex_;
   std::vector<std::thread> threads_ GUARDED_BY(threads_mutex_);
@@ -165,41 +160,24 @@ class Search {
   const PositionHistory& played_history_;
 
   Network* const network_;
-  const SearchLimits limits_;
+  const MoveList searchmoves_;
   const std::chrono::steady_clock::time_point start_time_;
   const int64_t initial_visits_;
 
   mutable SharedMutex nodes_mutex_;
-  EdgeAndNode best_move_edge_ GUARDED_BY(nodes_mutex_);
-  Edge* last_outputted_best_move_edge_ GUARDED_BY(nodes_mutex_) = nullptr;
+  EdgeAndNode current_best_edge_ GUARDED_BY(nodes_mutex_);
+  Edge* last_outputted_info_edge_ GUARDED_BY(nodes_mutex_) = nullptr;
   ThinkingInfo last_outputted_uci_info_ GUARDED_BY(nodes_mutex_);
   int64_t total_playouts_ GUARDED_BY(nodes_mutex_) = 0;
-  int remaining_playouts_ GUARDED_BY(nodes_mutex_) =
-      std::numeric_limits<int>::max();
   // Maximum search depth = length of longest path taken in PickNodetoExtend.
   uint16_t max_depth_ GUARDED_BY(nodes_mutex_) = 0;
   // Cummulative depth of all paths taken in PickNodetoExtend.
   uint64_t cum_depth_ GUARDED_BY(nodes_mutex_) = 0;
+  optional<std::chrono::steady_clock::time_point> nps_start_time_;
   std::atomic<int> tb_hits_{0};
 
-  BestMoveInfo::Callback best_move_callback_;
-  ThinkingInfo::Callback info_callback_;
-  // External parameters.
-  const int kMiniBatchSize;
-  const int kMaxPrefetchBatch;
-  const float kCpuct;
-  const float kTemperature;
-  const float kTemperatureVisitOffset;
-  const int kTempDecayMoves;
-  const bool kNoise;
-  const bool kVerboseStats;
-  const float kAggressiveTimePruning;
-  const float kFpuReduction;
-  const int kCacheHistoryLength;
-  const float kPolicySoftmaxTemp;
-  const int kAllowedNodeCollisions;
-  const bool kOutOfOrderEval;
-  const int kMultiPv;
+  std::unique_ptr<UciResponder> uci_responder_;
+  const SearchParams params_;
 
   friend class SearchWorker;
 };
@@ -209,13 +187,22 @@ class Search {
 // within one thread, have to split into stages.
 class SearchWorker {
  public:
-  SearchWorker(Search* search)
-      : search_(search), history_(search_->played_history_) {}
+  SearchWorker(Search* search, const SearchParams& params)
+      : search_(search), history_(search_->played_history_), params_(params) {}
 
   // Runs iterations while needed.
   void RunBlocking() {
-    while (search_->IsSearchActive()) {
-      ExecuteOneIteration();
+    LOGFILE << "Started search thread.";
+    try {
+      // A very early stop may arrive before this point, so the test is at the
+      // end to ensure at least one iteration runs before exiting.
+      do {
+        ExecuteOneIteration();
+      } while (search_->IsSearchActive());
+    } catch (std::exception& e) {
+      std::cerr << "Unhandled exception in worker thread: " << e.what()
+                << std::endl;
+      abort();
     }
   }
 
@@ -254,18 +241,41 @@ class SearchWorker {
 
  private:
   struct NodeToProcess {
-    NodeToProcess(Node* node, bool is_collision, uint16_t depth)
-        : node(node), depth(depth), is_collision(is_collision) {}
+    bool IsExtendable() const { return !is_collision && !node->IsTerminal(); }
+    bool IsCollision() const { return is_collision; }
+    bool CanEvalOutOfOrder() const {
+      return is_cache_hit || node->IsTerminal();
+    }
+
+    // The node to extend.
     Node* node;
     // Value from NN's value head, or -1/0/1 for terminal nodes.
     float v;
+    // Draw probability for NN's with WDL value head
+    float d;
+    int multivisit = 0;
     uint16_t depth;
-    bool is_collision = false;
     bool nn_queried = false;
     bool is_cache_hit = false;
+    bool is_collision = false;
+
+    static NodeToProcess Collision(Node* node, uint16_t depth,
+                                   int collision_count) {
+      return NodeToProcess(node, depth, true, collision_count);
+    }
+    static NodeToProcess Visit(Node* node, uint16_t depth) {
+      return NodeToProcess(node, depth, false, 1);
+    }
+
+   private:
+    NodeToProcess(Node* node, uint16_t depth, bool is_collision, int multivisit)
+        : node(node),
+          multivisit(multivisit),
+          depth(depth),
+          is_collision(is_collision) {}
   };
 
-  NodeToProcess PickNodeToExtend();
+  NodeToProcess PickNodeToExtend(int collision_limit);
   void ExtendNode(Node* node);
   bool AddNodeToComputation(Node* node, bool add_if_cached);
   int PrefetchIntoCache(Node* node, int budget);
@@ -281,6 +291,11 @@ class SearchWorker {
   PositionHistory history_;
   MoveList root_move_filter_;
   bool root_move_filter_populated_ = false;
+  int number_out_of_order_ = 0;
+  const SearchParams& params_;
+  std::unique_ptr<Node> precached_node_;
+  IterationStats iteration_stats_;
+  StoppersHints latest_time_manager_hints_;
 };
 
 }  // namespace lczero
