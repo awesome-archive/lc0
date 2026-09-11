@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2018-2020 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -28,16 +28,21 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <string>
+
+#include "neural/loader.h"
 #include "neural/network.h"
+#include "neural/wrapper.h"
 #include "utils/optionsdict.h"
+#include "utils/optionsparser.h"
 
 namespace lczero {
 
 class NetworkFactory {
  public:
   using FactoryFunc = std::function<std::unique_ptr<Network>(
-      const Weights&, const OptionsDict&)>;
+      const std::optional<WeightsFile>&, const OptionsDict&)>;
 
   static NetworkFactory* Get();
 
@@ -55,8 +60,29 @@ class NetworkFactory {
   std::vector<std::string> GetBackendsList() const;
 
   // Creates a backend given name and config.
-  std::unique_ptr<Network> Create(const std::string& network, const Weights&,
+  std::unique_ptr<Network> Create(const std::string& network,
+                                  const std::optional<WeightsFile>&,
                                   const OptionsDict& options);
+
+  // Helper function to load the network from the options. Returns nullptr
+  // if no network options changed since the previous call.
+  static std::unique_ptr<Network> LoadNetwork(const OptionsDict& options);
+
+  struct BackendConfiguration {
+    BackendConfiguration() = default;
+    BackendConfiguration(const OptionsDict& options);
+    std::string weights_path;
+    std::string backend;
+    std::string backend_options;
+    bool operator==(const BackendConfiguration& other) const;
+    bool operator!=(const BackendConfiguration& other) const {
+      return !operator==(other);
+    }
+    bool operator<(const BackendConfiguration& other) const {
+      return std::tie(weights_path, backend, backend_options) <
+             std::tie(other.weights_path, other.backend, other.backend_options);
+    }
+  };
 
  private:
   void RegisterNetwork(const std::string& name, FactoryFunc factory,
@@ -82,25 +108,36 @@ class NetworkFactory {
   friend class Register;
 };
 
-#define REGISTER_NETWORK_WITH_COUNTER2(name, cls, priority, counter) \
-  namespace {                                                        \
-  static NetworkFactory::Register regH38fhs##counter(                \
-      name,                                                          \
-      [](const Weights& w, const OptionsDict& o) {                   \
-        return std::make_unique<cls>(w, o);                          \
-      },                                                             \
-      priority);                                                     \
+#define REGISTER_NETWORK_WITH_COUNTER2(name, func, priority, counter)       \
+  namespace {                                                               \
+  namespace ns##counter {                                                   \
+    [[maybe_unused]] static NetworkFactory::Register regH38fhs##counter(    \
+        name,                                                               \
+        [](const std::optional<WeightsFile>& w, const OptionsDict& o) {     \
+          return func(w, o);                                                \
+        },                                                                  \
+        priority);                                                          \
+    [[maybe_unused]] static BackendManager::Register regK03nv##counter(     \
+        std::make_unique<NetworkAsBackendFactory>(                          \
+            name,                                                           \
+            [](const std::optional<WeightsFile>& w, const OptionsDict& o) { \
+              return func(w, o);                                            \
+            },                                                              \
+            priority));                                                     \
+  }                                                                         \
   }
-#define REGISTER_NETWORK_WITH_COUNTER(name, cls, priority, counter) \
-  REGISTER_NETWORK_WITH_COUNTER2(name, cls, priority, counter)
+
+#define REGISTER_NETWORK_WITH_COUNTER(name, func, priority, counter) \
+  REGISTER_NETWORK_WITH_COUNTER2(name, func, priority, counter)
 
 // Registers a Network.
 // Constructor of a network class must have parameters:
 // (const Weights& w, const OptionsDict& o)
 // @name -- name under which the backend will be known in configs.
-// @cls -- class name of a backend.
+// @func -- Factory function for a backend.
+//          std::unique_ptr<Network>(const WeightsFile&, const OptionsDict&)
 // @priority -- numeric priority of a backend. Higher is higher, highest number
 // is the default backend.
-#define REGISTER_NETWORK(name, cls, priority) \
-  REGISTER_NETWORK_WITH_COUNTER(name, cls, priority, __LINE__)
+#define REGISTER_NETWORK(name, func, priority) \
+  REGISTER_NETWORK_WITH_COUNTER(name, func, priority, __LINE__)
 }  // namespace lczero

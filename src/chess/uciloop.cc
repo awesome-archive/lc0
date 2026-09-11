@@ -27,6 +27,7 @@
 
 #include "uciloop.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -35,28 +36,50 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
 #include "utils/exception.h"
+#include "utils/logging.h"
 #include "utils/string.h"
 #include "version.h"
 
 namespace lczero {
-
 namespace {
+
+const OptionId kUciChess960{
+    {.long_flag = "chess960",
+     .uci_option = "UCI_Chess960",
+     .help_text = "Castling moves are encoded as \"king takes rook\".",
+     .visibility = OptionId::kAlwaysVisible}};
+const OptionId kShowWDL{{.long_flag = "show-wdl",
+                         .uci_option = "UCI_ShowWDL",
+                         .help_text = "Show win, draw and lose probability.",
+                         .visibility = OptionId::kAlwaysVisible}};
+const OptionId kShowEPS{
+    {.long_flag = "show-eps",
+     .uci_option = "UCI_ShowEPS",
+     .help_text = "Show neural network evaluations per second.",
+     .visibility = OptionId::kAlwaysVisible}};
+const OptionId kShowMovesleft{{.long_flag = "show-movesleft",
+                               .uci_option = "UCI_ShowMovesLeft",
+                               .help_text = "Show estimated moves left.",
+                               .visibility = OptionId::kAlwaysVisible}};
+
 const std::unordered_map<std::string, std::unordered_set<std::string>>
     kKnownCommands = {
         {{"uci"}, {}},
         {{"isready"}, {}},
-        {{"setoption"}, {"context", "name", "value"}},
+        {{"setoption"}, {"name", "value"}},
         {{"ucinewgame"}, {}},
         {{"position"}, {"fen", "startpos", "moves"}},
         {{"go"},
          {"infinite", "wtime", "btime", "winc", "binc", "movestogo", "depth",
-          "nodes", "movetime", "searchmoves", "ponder"}},
-        {{"start"}, {}},
+          "mate", "nodes", "movetime", "searchmoves", "ponder"}},
         {{"stop"}, {}},
         {{"ponderhit"}, {}},
         {{"quit"}, {}},
         {{"xyzzy"}, {}},
+        {{"fen"}, {}},
+        {{"wait"}, {}}
 };
 
 std::pair<std::string, std::unordered_map<std::string, std::string>>
@@ -71,9 +94,29 @@ ParseCommand(const std::string& line) {
   // If empty line, return empty command.
   if (token.empty()) return {};
 
-  auto command = kKnownCommands.find(token);
+  const auto command = kKnownCommands.find(token);
   if (command == kKnownCommands.end()) {
     throw Exception("Unknown command: " + line);
+  }
+
+  // Special parsing for setoption to keep strings unmodified.
+  if (command->first == "setoption") {
+    iss >> token;
+    if (token != "name") {
+      throw Exception("setoption must be followed by name");
+    }
+    int name_pos = iss.eof() ? line.length() : static_cast<int>(iss.tellg());
+    std::optional<int> value_pos;
+    while (iss >> token) {
+      if (token == "value") {
+        value_pos = iss.eof() ? line.length() : static_cast<int>(iss.tellg());
+        params["value"] = Trim(line.substr(*value_pos));
+        break;
+      }
+    }
+    params["name"] = Trim(line.substr(
+        name_pos, value_pos ? *value_pos - name_pos - 5 : std::string::npos));
+    return {"setoption", params};
   }
 
   std::string whitespace;
@@ -95,14 +138,14 @@ ParseCommand(const std::string& line) {
 std::string GetOrEmpty(
     const std::unordered_map<std::string, std::string>& params,
     const std::string& key) {
-  auto iter = params.find(key);
+  const auto iter = params.find(key);
   if (iter == params.end()) return {};
   return iter->second;
 }
 
 int GetNumeric(const std::unordered_map<std::string, std::string>& params,
                const std::string& key) {
-  auto iter = params.find(key);
+  const auto iter = params.find(key);
   if (iter == params.end()) {
     throw Exception("Unexpected error");
   }
@@ -112,53 +155,56 @@ int GetNumeric(const std::unordered_map<std::string, std::string>& params,
       throw Exception("expected value after " + key);
     }
     return std::stoi(str);
-  } catch (std::invalid_argument& e) {
+  } catch (std::invalid_argument&) {
     throw Exception("invalid value " + str);
+  } catch (const std::out_of_range&) {
+    throw Exception("out of range value " + str);
   }
 }
 
 bool ContainsKey(const std::unordered_map<std::string, std::string>& params,
                  const std::string& key) {
-  return params.find(key) != params.end();
+  return params.contains(key);
 }
-
 }  // namespace
 
-void UciLoop::RunLoop() {
-  std::cout.setf(std::ios::unitbuf);
-  std::string line;
-  while (std::getline(std::cin, line)) {
-    if (debug_log_) debug_log_ << '>' << line << std::endl << std::flush;
-    try {
-      auto command = ParseCommand(line);
-      // Ignore empty line.
-      if (command.first.empty()) continue;
-      if (!DispatchCommand(command.first, command.second)) break;
-    } catch (Exception& ex) {
-      SendResponse(std::string("error ") + ex.what());
-    }
-  }
+UciLoop::UciLoop(StringUciResponder* uci_responder, OptionsParser* options,
+                 EngineControllerBase* engine)
+    : uci_responder_(uci_responder), options_(options), engine_(engine) {
+  engine_->RegisterUciResponder(uci_responder_);
 }
+
+UciLoop::~UciLoop() { engine_->UnregisterUciResponder(uci_responder_); }
 
 bool UciLoop::DispatchCommand(
     const std::string& command,
     const std::unordered_map<std::string, std::string>& params) {
   if (command == "uci") {
-    CmdUci();
+    uci_responder_->SendId();
+    for (const auto& option : options_->ListOptionsUci()) {
+      uci_responder_->SendRawResponse(option);
+    }
+    uci_responder_->SendRawResponse("uciok");
   } else if (command == "isready") {
-    CmdIsReady();
+    engine_->EnsureReady();
+    uci_responder_->SendRawResponse("readyok");
   } else if (command == "setoption") {
-    CmdSetOption(GetOrEmpty(params, "name"), GetOrEmpty(params, "value"),
-                 GetOrEmpty(params, "context"));
+    if (GetOrEmpty(params, "name").empty()) {
+      throw Exception("setoption requires name");
+    } else {
+      options_->SetUciOption(GetOrEmpty(params, "name"),
+                             GetOrEmpty(params, "value"));
+    }
   } else if (command == "ucinewgame") {
-    CmdUciNewGame();
+    engine_->NewGame();
   } else if (command == "position") {
     if (ContainsKey(params, "fen") == ContainsKey(params, "startpos")) {
       throw Exception("Position requires either fen or startpos");
     }
-    std::vector<std::string> moves =
+    const std::vector<std::string> moves =
         StrSplitAtWhitespace(GetOrEmpty(params, "moves"));
-    CmdPosition(GetOrEmpty(params, "fen"), moves);
+    const std::string fen = GetOrEmpty(params, "fen");
+    engine_->SetPosition(fen.empty() ? ChessBoard::kStartposFen : fen, moves);
   } else if (command == "go") {
     GoParams go_params;
     if (ContainsKey(params, "infinite")) {
@@ -187,18 +233,19 @@ bool UciLoop::DispatchCommand(
     UCIGOOPTION(binc);
     UCIGOOPTION(movestogo);
     UCIGOOPTION(depth);
+    UCIGOOPTION(mate);
     UCIGOOPTION(nodes);
     UCIGOOPTION(movetime);
 #undef UCIGOOPTION
-    CmdGo(go_params);
+    engine_->Go(go_params);
+  } else if (command == "wait") {
+    engine_->Wait();
   } else if (command == "stop") {
-    CmdStop();
+    engine_->Stop();
   } else if (command == "ponderhit") {
-    CmdPonderHit();
-  } else if (command == "start") {
-    CmdStart();
+    engine_->PonderHit();
   } else if (command == "xyzzy") {
-    SendResponse("Nothing happens.");
+    uci_responder_->SendRawResponse("Nothing happens.");
   } else if (command == "quit") {
     return false;
   } else {
@@ -207,68 +254,94 @@ bool UciLoop::DispatchCommand(
   return true;
 }
 
-void UciLoop::SetLogFilename(const std::string& filename) {
-  if (filename.empty()) {
-    debug_log_.close();
-  } else {
-    debug_log_.open(filename.c_str(), std::ios::app);
-  }
+bool UciLoop::ProcessLine(const std::string& line) {
+  auto command = ParseCommand(line);
+  // Ignore empty line.
+  if (command.first.empty()) return true;
+  return DispatchCommand(command.first, command.second);
 }
 
-void UciLoop::SendResponse(const std::string& response) {
-  SendResponses({response});
+void StringUciResponder::PopulateParams(OptionsParser* options) {
+  options->Add<BoolOption>(kUciChess960) = false;
+  options->Add<BoolOption>(kShowWDL) = false;
+  options->Add<BoolOption>(kShowEPS) = false;
+  options->Add<BoolOption>(kShowMovesleft) = false;
+  options_ = &options->GetOptionsDict();
 }
 
-void UciLoop::SendResponses(const std::vector<std::string>& responses) {
-  static std::mutex output_mutex;
-  std::lock_guard<std::mutex> lock(output_mutex);
-  for (auto& response : responses) {
-    if (debug_log_) debug_log_ << '<' << response << std::endl << std::flush;
-    std::cout << response << std::endl;
-  }
+bool StringUciResponder::IsChess960() const {
+  return options_ ? options_->Get<bool>(kUciChess960) : false;
 }
 
-void UciLoop::SendId() {
-  SendResponse("id name Lc0 v" + GetVersionStr());
-  SendResponse("id author The LCZero Authors.");
+void StringUciResponder::SendRawResponse(const std::string& response) {
+  SendRawResponses({response});
 }
 
-void UciLoop::SendBestMove(const BestMoveInfo& move) {
-  std::string res = "bestmove " + move.bestmove.as_string();
-  if (move.ponder) res += " ponder " + move.ponder.as_string();
-  if (move.player != -1) res += " player " + std::to_string(move.player);
-  if (move.game_id != -1) res += " gameid " + std::to_string(move.game_id);
-  if (move.is_black)
-    res += " side " + std::string(*move.is_black ? "black" : "white");
-  SendResponse(res);
+void StringUciResponder::SendId() {
+  SendRawResponse("id name Lc0 v" + GetVersionStr());
+  SendRawResponse("id author The LCZero Authors.");
 }
 
-void UciLoop::SendInfo(const std::vector<ThinkingInfo>& infos) {
+void StringUciResponder::OutputBestMove(BestMoveInfo* info) {
+  const bool c960 = IsChess960();
+  std::string res = "bestmove " + info->bestmove.ToString(c960);
+  if (!info->ponder.is_null()) res += " ponder " + info->ponder.ToString(c960);
+  if (info->player != -1) res += " player " + std::to_string(info->player);
+  if (info->game_id != -1) res += " gameid " + std::to_string(info->game_id);
+  if (info->is_black)
+    res += " side " + std::string(*info->is_black ? "black" : "white");
+  SendRawResponse(res);
+}
+
+void StringUciResponder::OutputThinkingInfo(std::vector<ThinkingInfo>* infos) {
   std::vector<std::string> reses;
-  for (const auto& info : infos) {
+  const bool c960 = IsChess960();
+  for (const auto& info : *infos) {
     std::string res = "info";
     if (info.player != -1) res += " player " + std::to_string(info.player);
     if (info.game_id != -1) res += " gameid " + std::to_string(info.game_id);
     if (info.is_black)
       res += " side " + std::string(*info.is_black ? "black" : "white");
-    if (info.depth >= 0) res += " depth " + std::to_string(info.depth);
+    if (info.depth >= 0)
+      res += " depth " + std::to_string(std::max(info.depth, 1));
     if (info.seldepth >= 0) res += " seldepth " + std::to_string(info.seldepth);
     if (info.time >= 0) res += " time " + std::to_string(info.time);
     if (info.nodes >= 0) res += " nodes " + std::to_string(info.nodes);
+    if (info.mate) res += " score mate " + std::to_string(*info.mate);
     if (info.score) res += " score cp " + std::to_string(*info.score);
+    if (info.wdl && options_ && options_->Get<bool>(kShowWDL)) {
+      res += " wdl " + std::to_string(info.wdl->w) + " " +
+             std::to_string(info.wdl->d) + " " + std::to_string(info.wdl->l);
+    }
+    if (info.moves_left && options_ && options_->Get<bool>(kShowMovesleft)) {
+      res += " movesleft " + std::to_string(*info.moves_left);
+    }
     if (info.hashfull >= 0) res += " hashfull " + std::to_string(info.hashfull);
     if (info.nps >= 0) res += " nps " + std::to_string(info.nps);
+    if (info.eps >= 0 && options_ && options_->Get<bool>(kShowEPS)) {
+      res += " eps " + std::to_string(info.eps);
+    }
     if (info.tb_hits >= 0) res += " tbhits " + std::to_string(info.tb_hits);
     if (info.multipv >= 0) res += " multipv " + std::to_string(info.multipv);
 
     if (!info.pv.empty()) {
       res += " pv";
-      for (const auto& move : info.pv) res += " " + move.as_string();
+      for (const auto& move : info.pv) res += " " + move.ToString(c960);
     }
     if (!info.comment.empty()) res += " string " + info.comment;
     reses.push_back(std::move(res));
   }
-  SendResponses(reses);
+  SendRawResponses(reses);
+}
+
+void StdoutUciResponder::SendRawResponses(
+    const std::vector<std::string>& responses) {
+  static std::mutex output_mutex;
+  std::lock_guard<std::mutex> lock(output_mutex);
+  for (auto& response : responses) {
+    LOGFILE << "<< " << response;
+    std::cout << response << std::endl;
+  }
 }
 
 }  // namespace lczero

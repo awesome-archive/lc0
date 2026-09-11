@@ -28,11 +28,14 @@
 #pragma once
 
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+
 #include "chess/bitboard.h"
 #include "chess/position.h"
-#include "utils/optional.h"
+#include "utils/exception.h"
 
 namespace lczero {
 
@@ -48,9 +51,7 @@ struct BestMoveInfo {
   // Index of the game in the tournament (0-based).
   int game_id = -1;
   // The color of the player, if known.
-  optional<bool> is_black;
-
-  using Callback = std::function<void(const BestMoveInfo&)>;
+  std::optional<bool> is_black;
 };
 
 // Is sent during the search.
@@ -65,18 +66,29 @@ struct ThinkingInfo {
   int64_t nodes = -1;
   // Nodes per second.
   int nps = -1;
+  // Evaluations per second.
+  int eps = -1;
   // Hash fullness * 1000
   int hashfull = -1;
+  // Moves to mate.
+  std::optional<int> mate = std::nullopt;
   // Win in centipawns.
-  optional<int> score;
+  std::optional<int> score = std::nullopt;
+  // Win/Draw/Lose probability * 1000.
+  struct WDL {
+    int w;
+    int d;
+    int l;
+  };
+  std::optional<WDL> wdl = std::nullopt;
   // Number of successful TB probes (not the same as playouts ending in TB hit).
   int tb_hits = -1;
   // Best line found. Moves are from perspective of white player.
-  std::vector<Move> pv;
+  std::vector<Move> pv = {};
   // Multipv index.
   int multipv = -1;
   // Freeform comment.
-  std::string comment;
+  std::string comment = "";
 
   // Those are extensions and not really UCI protocol.
   // 1 if it's "player1", 2 if it's "player2"
@@ -84,9 +96,9 @@ struct ThinkingInfo {
   // Index of the game in the tournament (0-based).
   int game_id = -1;
   // The color of the player, if known.
-  optional<bool> is_black;
-
-  using Callback = std::function<void(const std::vector<ThinkingInfo>&)>;
+  std::optional<bool> is_black = std::nullopt;
+  // Moves left
+  std::optional<int> moves_left = std::nullopt;
 };
 
 // Is sent when a single game is finished.
@@ -95,16 +107,20 @@ struct GameInfo {
   GameResult game_result = GameResult::UNDECIDED;
   // Name of the file with training data.
   std::string training_filename;
+  // Initial fen of the game.
+  std::string initial_fen;
   // Game moves.
   std::vector<Move> moves;
+  // Ply within moves that the game actually started.
+  int play_start_ply;
   // Index of the game in the tournament (0-based).
   int game_id = -1;
   // The color of the player1, if known.
-  optional<bool> is_black;
+  std::optional<bool> is_black;
   // Minimum resign threshold which would have resulted in a false positive
   // if resign had of been enabled.
   // Only provided if the game wasn't played with resign enabled.
-  optional<float> min_false_positive_threshold;
+  std::optional<float> min_false_positive_threshold;
 
   using Callback = std::function<void(const GameInfo&)>;
 };
@@ -117,7 +133,104 @@ struct TournamentInfo {
   // Player1's [win/draw/lose] as [white/black].
   // e.g. results[2][1] is how many times player 1 lost as black.
   int results[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+  int move_count_ = 0;
+  uint64_t nodes_total_ = 0;
+
   using Callback = std::function<void(const TournamentInfo&)>;
+};
+
+// A class which knows how to output UCI responses.
+class UciResponder {
+ public:
+  virtual ~UciResponder() = default;
+  virtual void OutputBestMove(BestMoveInfo* info) = 0;
+  virtual void OutputThinkingInfo(std::vector<ThinkingInfo>* infos) = 0;
+};
+
+// The responder which forwards the output to another responder, with
+// observer-like subscription model.
+class UciResponderForwarder : public UciResponder {
+ public:
+  void OutputBestMove(BestMoveInfo* info) override {
+    if (wrapped_) wrapped_->OutputBestMove(info);
+  }
+  void OutputThinkingInfo(std::vector<ThinkingInfo>* infos) override {
+    if (wrapped_) wrapped_->OutputThinkingInfo(infos);
+  }
+  void Register(UciResponder* wrapped) {
+    if (wrapped_) {
+      throw Exception("UciResponderForwarder already has a wrapped responder");
+    }
+    wrapped_ = wrapped;
+  }
+  void Unregister(UciResponder* wrapped) {
+    if (wrapped_ != wrapped) {
+      throw Exception(
+          "UciResponderForwarder doesn't have this wrapped responder");
+    }
+    wrapped_ = nullptr;
+  }
+
+ private:
+  UciResponder* wrapped_ = nullptr;
+};
+
+// The responder which calls callbacks. Used for easier transition from old
+// code.
+class CallbackUciResponder : public UciResponder {
+ public:
+  using ThinkingCallback =
+      std::function<void(const std::vector<ThinkingInfo>&)>;
+  using BestMoveCallback = std::function<void(const BestMoveInfo&)>;
+
+  CallbackUciResponder(BestMoveCallback bestmove, ThinkingCallback info)
+      : bestmove_callback_(bestmove), info_callback_(info) {}
+
+  void OutputBestMove(BestMoveInfo* info) { bestmove_callback_(*info); }
+  void OutputThinkingInfo(std::vector<ThinkingInfo>* infos) {
+    info_callback_(*infos);
+  }
+
+ private:
+  const BestMoveCallback bestmove_callback_;
+  const ThinkingCallback info_callback_;
+};
+
+// The responnder which doesn't own the parent. Used to transition from old code
+// where we need to create a copy.
+class NonOwningUciRespondForwarder : public UciResponder {
+ public:
+  NonOwningUciRespondForwarder(UciResponder* parent) : parent_(parent) {}
+  virtual void OutputBestMove(BestMoveInfo* info) {
+    parent_->OutputBestMove(info);
+  }
+  virtual void OutputThinkingInfo(std::vector<ThinkingInfo>* infos) {
+    parent_->OutputThinkingInfo(infos);
+  }
+
+ private:
+  UciResponder* const parent_;
+};
+
+// Base class for uci response transformations.
+class TransformingUciResponder : public UciResponder {
+ public:
+  TransformingUciResponder(std::unique_ptr<UciResponder> parent)
+      : parent_(std::move(parent)) {}
+
+  virtual void TransformBestMove(BestMoveInfo*) {}
+  virtual void TransformThinkingInfo(std::vector<ThinkingInfo>*) {}
+
+ private:
+  virtual void OutputBestMove(BestMoveInfo* info) {
+    TransformBestMove(info);
+    parent_->OutputBestMove(info);
+  }
+  virtual void OutputThinkingInfo(std::vector<ThinkingInfo>* infos) {
+    TransformThinkingInfo(infos);
+    parent_->OutputThinkingInfo(infos);
+  }
+  std::unique_ptr<UciResponder> parent_;
 };
 
 }  // namespace lczero

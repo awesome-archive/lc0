@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2024 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -27,120 +27,63 @@
 
 #pragma once
 
-#include "chess/uciloop.h"
-#include "mcts/search.h"
-#include "neural/cache.h"
-#include "neural/network.h"
-#include "syzygy/syzygy.h"
-#include "utils/mutex.h"
-#include "utils/optional.h"
-#include "utils/optionsparser.h"
+#include <vector>
 
-// CUDNN eval
-// comment/disable this to enable tensor flow path
-#define CUDNN_EVAL 1
+#include "chess/gamestate.h"
+#include "engine_loop.h"
+#include "neural/memcache.h"
+#include "search/search.h"
+#include "syzygy/syzygy.h"
 
 namespace lczero {
 
-struct CurrentPosition {
-  std::string fen;
-  std::vector<std::string> moves;
-};
-
-class EngineController {
+class Engine : public EngineControllerBase {
  public:
-  EngineController(BestMoveInfo::Callback best_move_callback,
-                   ThinkingInfo::Callback info_callback,
-                   const OptionsDict& options);
+  Engine(const SearchFactory&, const OptionsDict&);
+  ~Engine() override;
 
-  ~EngineController() {
-    // Make sure search is destructed first, and it still may be running in
-    // a separate thread.
-    search_.reset();
-  }
+  static void PopulateOptions(OptionsParser*);
 
-  void PopulateOptions(OptionsParser* options);
-
-  // Blocks.
-  void EnsureReady();
-
-  // Must not block.
-  void NewGame();
-
-  // Blocks.
+  void EnsureReady() override;
+  void NewGame() override;
   void SetPosition(const std::string& fen,
-                   const std::vector<std::string>& moves);
-
-  // Must not block.
-  void Go(const GoParams& params);
-  void PonderHit();
-  // Must not block.
-  void Stop();
-  void SetCacheSize(int size);
-
-  SearchLimits PopulateSearchLimits(int ply, bool is_black,
-                                    const GoParams& params);
-
- private:
-  void UpdateTBAndNetwork();
-
-  void SetupPosition(const std::string& fen,
-                     const std::vector<std::string>& moves);
-
-  const OptionsDict& options_;
-
-  BestMoveInfo::Callback best_move_callback_;
-  ThinkingInfo::Callback info_callback_;
-
-  // Locked means that there is some work to wait before responding readyok.
-  RpSharedMutex busy_mutex_;
-  using SharedLock = std::shared_lock<RpSharedMutex>;
-
-  std::unique_ptr<Search> search_;
-  std::unique_ptr<NodeTree> tree_;
-  std::unique_ptr<SyzygyTablebase> syzygy_tb_;
-  std::unique_ptr<Network> network_;
-  NNCache cache_;
-
-  // Store current TB and network settings to track when they change so that
-  // they are reloaded.
-  std::string tb_paths_;
-  std::string network_path_;
-  std::string backend_;
-  std::string backend_options_;
-
-  // The current position as given with SetPosition. For normal (ie. non-ponder)
-  // search, the tree is set up with this position, however, during ponder we
-  // actually search the position one move earlier.
-  optional<CurrentPosition> current_position_;
-  GoParams go_params_;
-
-  // How much less time was used by search than what was allocated.
-  int64_t time_spared_ms_ = 0;
-};
-
-class EngineLoop : public UciLoop {
- public:
-  EngineLoop();
-
-  void RunLoop() override;
-  void CmdUci() override;
-  void CmdIsReady() override;
-  void CmdSetOption(const std::string& name, const std::string& value,
-                    const std::string& context) override;
-  void CmdUciNewGame() override;
-  void CmdPosition(const std::string& position,
                    const std::vector<std::string>& moves) override;
-  void CmdGo(const GoParams& params) override;
-  void CmdPonderHit() override;
-  void CmdStop() override;
+  void Go(const GoParams& params) override;
+  void PonderHit() override;
+  void Wait() override;
+  void Stop() override;
+
+  void RegisterUciResponder(UciResponder*) override;
+  void UnregisterUciResponder(UciResponder*) override;
 
  private:
-  void EnsureOptionsSent();
+  void UpdateBackendConfig();
+  void EnsureSearchStopped();
+  void EnsureSyzygyTablebasesLoaded();
+  void InitializeSearchPosition(bool for_ponder);
 
-  OptionsParser options_;
-  bool options_sent_ = false;
-  EngineController engine_;
+  class UciPonderForwarder;
+  std::unique_ptr<UciPonderForwarder> uci_forwarder_;
+  const OptionsDict& options_;
+  std::unique_ptr<SearchBase> search_;  // absl_notnull
+  std::string backend_name_;  // Remember the backend name to track changes.
+  std::unique_ptr<CachingBackend> backend_;  // absl_nullable
+
+  // Remember previous tablebase paths to detect when to reload them.
+  std::string previous_tb_paths_;
+  std::unique_ptr<SyzygyTablebase> syzygy_tb_;  // absl_nullable
+
+  // UCI parameters cache to be consistent between `position` and `go`.
+  // Defaults ensure correct operation even if `go` comes first.
+  bool strict_uci_timing_ = true;
+  bool isready_seen_ = true;
+  // Last position set for the search. Used to:
+  // 1. Detect whether the position was ever set (to initialize to startpos).
+  // 2. Remember the position for ponder go (removing the last ply).
+  // 3. Remember the position for ponderhit.
+  std::optional<GameState> last_position_ = std::nullopt;
+  // Go parameters for the last search. Used on ponder.
+  std::optional<GoParams> last_go_params_ = std::nullopt;
 };
 
 }  // namespace lczero

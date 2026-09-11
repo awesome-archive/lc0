@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2018-2023 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -30,42 +30,12 @@
 #include <memory>
 #include <vector>
 
+#include "proto/net.pb.h"
+#include "utils/exception.h"
+
 namespace lczero {
 
 const int kInputPlanes = 112;
-
-struct Weights {
-  using Vec = std::vector<float>;
-  struct ConvBlock {
-    Vec weights;
-    Vec biases;
-    Vec bn_means;
-    Vec bn_stddivs;
-  };
-
-  struct Residual {
-    ConvBlock conv1;
-    ConvBlock conv2;
-  };
-
-  // Input convnet.
-  ConvBlock input;
-
-  // Residual tower.
-  std::vector<Residual> residual;
-
-  // Policy head
-  ConvBlock policy;
-  Vec ip_pol_w;
-  Vec ip_pol_b;
-
-  // Value head
-  ConvBlock value;
-  Vec ip1_val_w;
-  Vec ip1_val_b;
-  Vec ip2_val_w;
-  Vec ip2_val_b;
-};
 
 // All input planes are 64 value vectors, every element of which is either
 // 0 or some value, unique for the plane. Therefore, input is defined as
@@ -93,15 +63,66 @@ class NetworkComputation {
   virtual int GetBatchSize() const = 0;
   // Returns Q value of @sample.
   virtual float GetQVal(int sample) const = 0;
+  virtual float GetDVal(int sample) const = 0;
   // Returns P value @move_id of @sample.
   virtual float GetPVal(int sample, int move_id) const = 0;
-  virtual ~NetworkComputation() {}
+  virtual float GetMVal(int sample) const = 0;
+  virtual ~NetworkComputation() = default;
+};
+
+// The plan:
+// 1. Search must not look directly into any fields of NetworkFormat anymore.
+// 2. Backends populate NetworkCapabilities that show search how to use NN, both
+//    for input and output.
+// 3. Input part of NetworkCapabilities is just copy of InputFormat for now, and
+//    is likely to stay so (because search not knowing how to use NN is not very
+//    useful), but it's fine if it will change.
+// 4. On the other hand, output part of NetworkCapabilities is set of
+//    independent parameters (like WDL, moves left head etc), because search can
+//    look what's set and act accordingly. Backends may derive it from
+//    output head format fields or other places.
+
+struct NetworkCapabilities {
+  pblczero::NetworkFormat::InputFormat input_format;
+  pblczero::NetworkFormat::OutputFormat output_format;
+  pblczero::NetworkFormat::MovesLeftFormat moves_left;
+  // TODO expose information of whether GetDVal() is usable or always zero.
+
+  // Combines capabilities by setting the most restrictive ones. May throw
+  // exception.
+  void Merge(const NetworkCapabilities& other) {
+    if (input_format != other.input_format) {
+      throw Exception("Incompatible input formats, " +
+                      std::to_string(input_format) + " vs " +
+                      std::to_string(other.input_format));
+    }
+    if (output_format != other.output_format) {
+      throw Exception("Incompatible output formats, " +
+                      std::to_string(output_format) + " vs " +
+                      std::to_string(other.output_format));
+    }
+    if (!other.has_mlh()) moves_left = pblczero::NetworkFormat::MOVES_LEFT_NONE;
+  }
+
+  bool has_mlh() const {
+    return moves_left != pblczero::NetworkFormat::MOVES_LEFT_NONE;
+  }
+
+  bool has_wdl() const {
+    return output_format == pblczero::NetworkFormat::OUTPUT_WDL;
+  }
 };
 
 class Network {
  public:
+  virtual const NetworkCapabilities& GetCapabilities() const = 0;
   virtual std::unique_ptr<NetworkComputation> NewComputation() = 0;
-  virtual ~Network(){};
+  virtual int GetThreads() const { return 1; }
+  virtual void InitThread(int /*id*/) {}
+  virtual bool IsCpu() const { return false; }
+  virtual int GetMiniBatchSize() const { return 256; }
+  virtual int GetPreferredBatchStep() const { return 1; }
+  virtual ~Network() = default;
 };
 
 }  // namespace lczero

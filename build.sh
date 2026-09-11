@@ -2,6 +2,9 @@
 
 set -e
 
+# Move to this script's directory.
+CDPATH= cd -- "$(dirname -- "$0")"
+
 case $1 in
   plain|debug|debugoptimized|release|minsize)
     BUILDTYPE=$1
@@ -14,20 +17,19 @@ esac
 
 BUILDDIR=build/${BUILDTYPE}
 
-if [ -d ${BUILDDIR} ]
+MESON=$(PATH="${PATH}:${HOME}/.local/bin" command -v meson || :)
+MESON=${MESON:?"Could not find meson. Is it installed and in PATH?"}
+
+if [ -f "${BUILDDIR}/build.ninja" ]
 then
-  meson configure ${BUILDDIR} --buildtype ${BUILDTYPE} --prefix ${INSTALL_PREFIX:-/usr/local} "$@"
+  "${MESON}" configure "${BUILDDIR}" -Dbuildtype="${BUILDTYPE}" -Dprefix="${INSTALL_PREFIX:-/usr/local}" "$@"
 else
-  meson ${BUILDDIR} --buildtype ${BUILDTYPE} --prefix ${INSTALL_PREFIX:-/usr/local} "$@"
+  "${MESON}" setup "${BUILDDIR}" --buildtype "${BUILDTYPE}" --prefix "${INSTALL_PREFIX:-/usr/local}" "$@"
 fi
 
-pushd ${BUILDDIR}
+"${MESON}" compile -C "${BUILDDIR}"
 
 if [ -n "${INSTALL_PREFIX}" ]
 then
-  ninja install
-else
-  ninja
+  "${MESON}" install -C "${BUILDDIR}"
 fi
-
-popd

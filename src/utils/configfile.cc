@@ -25,67 +25,115 @@
   Program grant you additional permission to convey the resulting work.
 */
 
+#include "utils/configfile.h"
+
 #include <fstream>
-#include <iostream>
 #include <sstream>
 
 #include "utils/commandline.h"
-#include "utils/configfile.h"
+#include "utils/filesystem.h"
+#include "utils/logging.h"
 #include "utils/optionsparser.h"
 #include "utils/string.h"
 
 namespace lczero {
 namespace {
-const char* kConfigFileStr = "Configuration file path";
+const OptionId kConfigFileId{
+    "config", "ConfigFile",
+    "Path to a configuration file. The format of the file is one command line "
+    "parameter per line, e.g.:\n--weights=/path/to/weights",
+    'c'};
 const char* kDefaultConfigFile = "lc0.config";
+const char* kDefaultConfigFileParam = "<default>";
 }  // namespace
 
 std::vector<std::string> ConfigFile::arguments_;
 
 void ConfigFile::PopulateOptions(OptionsParser* options) {
-  options->Add<StringOption>(kConfigFileStr, "config", 'c') =
-      kDefaultConfigFile;
+  options->Add<StringOption>(kConfigFileId) = kDefaultConfigFile;
 }
 
-bool ConfigFile::Init(OptionsParser* options) {
+// This is needed to get the config file from the parameters without calling
+// ProcessAllFlags() that should be called only once, and needs the config file.
+std::string ConfigFile::ProcessConfigFlag(
+    const std::vector<std::string>& args) {
+  std::string filename = kDefaultConfigFileParam;
+  for (auto iter = args.begin(), end = args.end(); iter != end; ++iter) {
+    std::string param = *iter;
+
+    if (param.substr(0, 2) == "--") {
+      param = param.substr(2);
+      const auto pos = param.find('=');
+      if (pos != std::string::npos) {
+        if (param.substr(0, pos) == kConfigFileId.long_flag()) {
+          filename = param.substr(pos + 1);
+        }
+      }
+    }
+    if (param.size() == 2 && param[0] == '-') {
+      if (param[1] == kConfigFileId.short_flag() && iter + 1 != end) {
+        filename = *(iter + 1);
+        ++iter;
+      }
+    }
+  }
+  return filename;
+}
+
+bool ConfigFile::Init() {
   arguments_.clear();
 
-  // Process flags to get the config file parameter.
-  if (!options->ProcessAllFlags()) return false;
+  // Get the path from the config file parameter.
+  std::string filename = ProcessConfigFlag(CommandLine::Arguments());
 
-  // Calculate the relative path of the config file.
-  OptionsDict dict = options->GetOptionsDict();
-  std::string filename = dict.Get<std::string>(kConfigFileStr);
-
-  // If filename is an empty string then return true.  This is to override 
+  // If filename is an empty string then return true. This is to override
   // loading the default configuration file.
   if (filename == "") return true;
 
-  filename = CommandLine::BinaryDirectory() + "/" + filename;
-
   // Parses the file into the arguments_ vector.
-  if (!ParseFile(filename, options)) return false;
+  if (!ParseFile(filename)) return false;
 
   return true;
 }
 
-bool ConfigFile::ParseFile(const std::string& filename, OptionsParser* options) {
-  std::ifstream input(filename);
-
+bool ConfigFile::ParseFile(std::string& filename) {
   // Check to see if we are using the default config file or not.
-  OptionsDict dict = options->GetOptionsDict();
-  bool using_default_config = dict.IsDefault<std::string>(kConfigFileStr);
+  const bool using_default_config = 
+      filename == std::string(kDefaultConfigFileParam);
+
+  std::ifstream input;
+
+  // If no logfile was set on the command line, then the default is
+  // to check in the binary directory.
+  if (using_default_config) {
+    std::vector<std::string> config_dirs = {CommandLine::BinaryDirectory()};
+    const std::string user_config_path = GetUserConfigDirectory();
+    if (!user_config_path.empty()) {
+      config_dirs.emplace_back(user_config_path + "lc0");
+    }
+    for (const auto& dir : GetSystemConfigDirectoryList()) {
+      config_dirs.emplace_back(dir + (dir.back() == '/' ? "" : "/") + "lc0");
+    }
+
+    for (const auto& dir : config_dirs) {
+      filename = dir + '/' + kDefaultConfigFile;
+      input.open(filename);
+      if (input.is_open()) break;
+    }
+  } else {
+    input.open(filename);
+  }
 
   if (!input.is_open()) {
     // It is okay if we cannot open the default file since it is normal
     // for it to not exist.
     if (using_default_config) return true;
 
-    std::cerr << "Could not open configuration file: " << filename << std::endl;
+    CERR << "Could not open configuration file: " << filename;
     return false;
   }
 
-  std::cerr << "Found configuration file: " << filename << std::endl;
+  CERR << "Found configuration file: " << filename;
 
   for (std::string line; getline(input, line);) {
     // Remove all leading and trailing whitespace.
@@ -94,14 +142,14 @@ bool ConfigFile::ParseFile(const std::string& filename, OptionsParser* options) 
     if (line.substr(0, 1) == "#") continue;
     // Skip blank lines.
     if (line.length() == 0) continue;
-    // Allow long form arugments that omit '--'.  If omitted, add here.
+    // Allow long form arguments that omit '--'.  If omitted, add here.
     if (line.substr(0, 1) != "-" && line.substr(0, 2) != "--") {
       line = "--" + line;
     }
     // Fail now if the argument does not begin with '--'.
     if (line.substr(0, 2) != "--") {
-      std::cerr << "Only '--' arguments are supported in the "
-                << "configuration file: '" << line << "'." << std::endl;
+      CERR << "Only '--' arguments are supported in the "
+           << "configuration file: '" << line << "'.";
       return false;
     }
     // Add the line to the arguments list.

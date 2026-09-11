@@ -26,62 +26,44 @@
 */
 
 #include "selfplay/loop.h"
+
+#include <optional>
+
 #include "selfplay/tournament.h"
 #include "utils/configfile.h"
+#include "utils/optionsparser.h"
 
 namespace lczero {
 
 namespace {
-const char* kInteractive = "Run in interactive mode with uci-like interface";
+const OptionId kLogFileId{"logfile", "LogFile",
+                          "Write log to that file. Special value <stderr> to "
+                          "output the log to the console."};
 }  // namespace
-
-SelfPlayLoop::SelfPlayLoop() {}
 
 SelfPlayLoop::~SelfPlayLoop() {
   if (tournament_) tournament_->Abort();
   if (thread_) thread_->join();
 }
 
-void SelfPlayLoop::RunLoop() {
-  options_.Add<BoolOption>(kInteractive, "interactive") = false;
+void SelfPlayLoop::Run() {
   SelfPlayTournament::PopulateOptions(&options_);
 
+  options_.Add<StringOption>(kLogFileId);
+
   if (!options_.ProcessAllFlags()) return;
-  if (options_.GetOptionsDict().Get<bool>(kInteractive)) {
-    UciLoop::RunLoop();
-  } else {
-    // Send id before starting tournament to allow wrapping client to know
-    // who we are.
-    SendId();
-    SelfPlayTournament tournament(
-        options_.GetOptionsDict(),
-        std::bind(&UciLoop::SendBestMove, this, std::placeholders::_1),
-        std::bind(&UciLoop::SendInfo, this, std::placeholders::_1),
-        std::bind(&SelfPlayLoop::SendGameInfo, this, std::placeholders::_1),
-        std::bind(&SelfPlayLoop::SendTournament, this, std::placeholders::_1));
-    tournament.RunBlocking();
-  }
-}
 
-void SelfPlayLoop::CmdUci() {
-  SendId();
-  for (const auto& option : options_.ListOptionsUci()) {
-    SendResponse(option);
-  }
-  SendResponse("uciok");
-}
+  Logging::Get().SetFilename(
+      options_.GetOptionsDict().Get<std::string>(kLogFileId));
 
-void SelfPlayLoop::CmdStart() {
-  if (tournament_) return;
-  options_.SendAllOptions();
-  tournament_ = std::make_unique<SelfPlayTournament>(
-      options_.GetOptionsDict(),
-      std::bind(&UciLoop::SendBestMove, this, std::placeholders::_1),
-      std::bind(&UciLoop::SendInfo, this, std::placeholders::_1),
+  // Send id before starting tournament to allow wrapping client to know
+  // who we are.
+  uci_responder_->SendId();
+  SelfPlayTournament tournament(
+      options_.GetOptionsDict(), uci_responder_,
       std::bind(&SelfPlayLoop::SendGameInfo, this, std::placeholders::_1),
       std::bind(&SelfPlayLoop::SendTournament, this, std::placeholders::_1));
-  thread_ =
-      std::make_unique<std::thread>([this]() { tournament_->RunBlocking(); });
+  tournament.RunBlocking();
 }
 
 void SelfPlayLoop::SendGameInfo(const GameInfo& info) {
@@ -99,39 +81,77 @@ void SelfPlayLoop::SendGameInfo(const GameInfo& info) {
   if (!info.training_filename.empty())
     res += " trainingfile " + info.training_filename;
   if (info.game_id != -1) res += " gameid " + std::to_string(info.game_id);
+  res += " play_start_ply " + std::to_string(info.play_start_ply);
   if (info.is_black)
     res += " player1 " + std::string(*info.is_black ? "black" : "white");
   if (info.game_result != GameResult::UNDECIDED) {
     res += std::string(" result ") +
-           ((info.game_result == GameResult::DRAW)
-                ? "draw"
-                : (info.game_result == GameResult::WHITE_WON) ? "whitewon"
-                                                              : "blackwon");
+           ((info.game_result == GameResult::DRAW)        ? "draw"
+            : (info.game_result == GameResult::WHITE_WON) ? "whitewon"
+                                                          : "blackwon");
   }
   if (!info.moves.empty()) {
     res += " moves";
-    for (const auto& move : info.moves) res += " " + move.as_string();
+    for (const auto& move : info.moves) res += " " + move.ToString(true);
+  }
+  if (!info.initial_fen.empty() &&
+      info.initial_fen != ChessBoard::kStartposFen) {
+    res += " from_fen " + info.initial_fen;
   }
   responses.push_back(res);
-  SendResponses(responses);
-}
-
-void SelfPlayLoop::CmdSetOption(const std::string& name,
-                                const std::string& value,
-                                const std::string& context) {
-  options_.SetOption(name, value, context);
+  uci_responder_->SendRawResponses(responses);
 }
 
 void SelfPlayLoop::SendTournament(const TournamentInfo& info) {
-  std::string res = "tournamentstatus";
-  if (info.finished) res += " final";
-  res += " win " + std::to_string(info.results[0][0]) + " " +
-         std::to_string(info.results[0][1]);
-  res += " lose " + std::to_string(info.results[2][0]) + " " +
-         std::to_string(info.results[2][1]);
-  res += " draw " + std::to_string(info.results[1][0]) + " " +
-         std::to_string(info.results[1][1]);
-  SendResponse(res);
+  const int winp1 = info.results[0][0] + info.results[0][1];
+  const int losep1 = info.results[2][0] + info.results[2][1];
+  const int draws = info.results[1][0] + info.results[1][1];
+
+  // Initialize variables.
+  float percentage = -1;
+  std::optional<float> elo;
+  std::optional<float> los;
+
+  // Only caculate percentage if any games at all (avoid divide by 0).
+  if ((winp1 + losep1 + draws) > 0) {
+    percentage =
+        (static_cast<float>(draws) / 2 + winp1) / (winp1 + losep1 + draws);
+  }
+  // Calculate elo and los if percentage strictly between 0 and 1 (avoids divide
+  // by 0 or overflow).
+  if ((percentage < 1) && (percentage > 0))
+    elo = -400 * log(1 / percentage - 1) / log(10);
+  if ((winp1 + losep1) > 0) {
+    los = .5f +
+          .5f * std::erf((winp1 - losep1) / std::sqrt(2.0 * (winp1 + losep1)));
+  }
+  std::ostringstream oss;
+  oss << "tournamentstatus";
+  if (info.finished) oss << " final";
+  oss << " P1: +" << winp1 << " -" << losep1 << " =" << draws;
+
+  if (percentage > 0) {
+    oss << " Win: " << std::fixed << std::setw(5) << std::setprecision(2)
+        << (percentage * 100.0f) << "%";
+  }
+  if (elo) {
+    oss << " Elo: " << std::fixed << std::setw(5) << std::setprecision(2)
+        << (*elo);
+  }
+  if (los) {
+    oss << " LOS: " << std::fixed << std::setw(5) << std::setprecision(2)
+        << (*los * 100.0f) << "%";
+  }
+
+  oss << " P1-W: +" << info.results[0][0] << " -" << info.results[2][0] << " ="
+      << info.results[1][0];
+  oss << " P1-B: +" << info.results[0][1] << " -" << info.results[2][1] << " ="
+      << info.results[1][1];
+  oss << " npm " + std::to_string(static_cast<double>(info.nodes_total_) /
+                                  info.move_count_);
+  oss << " nodes " + std::to_string(info.nodes_total_);
+  oss << " moves " + std::to_string(info.move_count_);
+  uci_responder_->SendRawResponse(oss.str());
 }
 
 }  // namespace lczero
